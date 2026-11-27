@@ -254,3 +254,75 @@ final class CachedSecretTests: XCTestCase {
         XCTAssertEqual(backend.reads, 2)
     }
 }
+
+final class RefreshBackoffTests: XCTestCase {
+    let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    func testDoublesFromTwiceTheIntervalUpToTheCap() {
+        var backoff = RefreshBackoff()
+        let delays = (0..<6).map { _ in
+            backoff.recordFailure(at: now, refreshInterval: 300).timeIntervalSince(now)
+        }
+        XCTAssertEqual(delays, [600, 1200, 2400, 3600, 3600, 3600])
+        XCTAssertEqual(backoff.failures, 6)
+    }
+
+    func testOneMinuteInterval() {
+        var backoff = RefreshBackoff()
+        let delays = (0..<7).map { _ in
+            backoff.recordFailure(at: now, refreshInterval: 60).timeIntervalSince(now)
+        }
+        XCTAssertEqual(delays, [120, 240, 480, 960, 1920, 3600, 3600])
+    }
+
+    func testRetryAfterWinsWhenLonger() {
+        var backoff = RefreshBackoff()
+        XCTAssertEqual(backoff.recordFailure(at: now, refreshInterval: 300, retryAfter: 1800)
+            .timeIntervalSince(now), 1800)
+        // Shorter than the exponential delay: ignored.
+        XCTAssertEqual(backoff.recordFailure(at: now, refreshInterval: 300, retryAfter: 10)
+            .timeIntervalSince(now), 1200)
+        // Absurd values are capped.
+        XCTAssertEqual(backoff.recordFailure(at: now, refreshInterval: 300, retryAfter: 86400)
+            .timeIntervalSince(now), RefreshBackoff.maxDelay)
+    }
+
+    func testAllowsAttemptOnlyAfterTheDeadline() {
+        var backoff = RefreshBackoff()
+        XCTAssertTrue(backoff.allowsAttempt(at: now))
+        let next = backoff.recordFailure(at: now, refreshInterval: 300)
+        XCTAssertFalse(backoff.allowsAttempt(at: now))
+        XCTAssertFalse(backoff.allowsAttempt(at: next.addingTimeInterval(-1)))
+        XCTAssertTrue(backoff.allowsAttempt(at: next))
+    }
+
+    func testResetStartsOver() {
+        var backoff = RefreshBackoff()
+        backoff.recordFailure(at: now, refreshInterval: 300)
+        backoff.recordFailure(at: now, refreshInterval: 300)
+        backoff.reset()
+        XCTAssertNil(backoff.nextAttempt)
+        XCTAssertTrue(backoff.allowsAttempt(at: now))
+        XCTAssertEqual(backoff.recordFailure(at: now, refreshInterval: 300).timeIntervalSince(now), 600)
+    }
+}
+
+final class RetryAfterTests: XCTestCase {
+    func testSeconds() {
+        XCTAssertEqual(RetryAfter.parse("120"), 120)
+        XCTAssertEqual(RetryAfter.parse(" 0 "), 0)
+        XCTAssertEqual(RetryAfter.parse("-5"), 0)
+    }
+
+    func testHTTPDate() {
+        let now = DateParsing.parseISO8601("2015-10-21T07:00:00Z")!
+        XCTAssertEqual(RetryAfter.parse("Wed, 21 Oct 2015 07:28:00 GMT", now: now), 28 * 60)
+        XCTAssertEqual(RetryAfter.parse("Wed, 21 Oct 2015 06:00:00 GMT", now: now), 0)
+    }
+
+    func testMissingOrGarbage() {
+        XCTAssertNil(RetryAfter.parse(nil))
+        XCTAssertNil(RetryAfter.parse(""))
+        XCTAssertNil(RetryAfter.parse("soon"))
+    }
+}

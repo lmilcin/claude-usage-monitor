@@ -106,6 +106,19 @@ From the menu:
 - **Check for Updates Automatically**: on by default
 - **Organization**: only appears if your session key can see more than one claude.ai org
 
+When the server pushes back, automatic refreshes slow down instead of retrying at the usual
+pace:
+
+- **Rate limited (HTTP 429), server errors (5xx) or a Cloudflare block:** the app waits twice
+  the refresh interval, then doubles the wait after each further failure, up to an hour. It
+  waits longer if the server's `Retry-After` header asks for it. The menu shows when the next
+  try is, and the first successful refresh ends the backoff.
+- **Session key or Claude Code login rejected:** the app stops sending that credential
+  automatically. It resumes on its own once the credential changes, whether you set a new key
+  or run `claude` to log in again.
+
+**Refresh Now** always sends one request, even during a backoff or with a rejected credential.
+
 ## Data sources
 
 | Source | Endpoint | Setup | Notes |

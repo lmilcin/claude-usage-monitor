@@ -22,7 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isRefreshing = false
 
     private var timer: Timer?
+    /// A one-off extra refresh: a minute after a network error, or when a backoff ends.
     private var retryTask: Task<Void, Never>?
+    /// Holds off automatic refreshes after 429s, 5xx errors and Cloudflare blocks.
+    private var backoff = RefreshBackoff()
 
     private let updates = UpdateService()
     private var availableUpdate: ReleaseInfo?
@@ -78,8 +81,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.timer = timer
     }
 
-    @objc private func refreshNow() {
+    /// The "Refresh Now" menu item.
+    @objc private func refreshFromMenu() {
+        refresh(userInitiated: true)
+    }
+
+    /// Timer, wake and retry refreshes. Skipped while backing off.
+    private func refreshNow() {
+        refresh(userInitiated: false)
+    }
+
+    /// - Parameter userInitiated: the user asked for it (menu item, settings change). Such a
+    ///   refresh ignores the backoff and may resend a credential the server rejected.
+    private func refresh(userInitiated: Bool) {
         checkForUpdatesIfDue()
+        guard userInitiated || backoff.allowsAttempt(at: Date()) else { return }
         guard !isRefreshing else { return }
         isRefreshing = true
         retryTask?.cancel()
@@ -91,14 +107,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             do {
                 let key = source == .claudeAI ? try await loadSessionKey() : nil
-                let result = try await service.fetch(source: source, sessionKey: key, preferredOrgID: orgID)
+                let result = try await service.fetch(
+                    source: source, sessionKey: key, preferredOrgID: orgID, userInitiated: userInitiated)
                 snapshot = result.snapshot
                 organizations = result.organizations
                 activeOrganizationID = result.organizationID
                 lastError = nil
+                backoff.reset()
             } catch {
                 lastError = error
-                scheduleRetryIfTransient(error)
+                scheduleRetry(after: error)
             }
             isRefreshing = false
             updateStatusButton()
@@ -123,11 +141,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Network blips (e.g. right after login / wake) shouldn't leave the icon stale for a full interval.
-    private func scheduleRetryIfTransient(_ error: Error) {
-        guard error is URLError, settings.refreshMinutes > 1 else { return }
+    private func scheduleRetry(after error: Error) {
+        if let error = error as? UsageError, error.isThrottling {
+            // The server wants us to slow down: skip timer ticks until the backoff ends,
+            // then try once right on time.
+            let next = backoff.recordFailure(
+                at: Date(), refreshInterval: TimeInterval(settings.refreshMinutes * 60),
+                retryAfter: error.retryAfter)
+            scheduleRetry(at: next)
+        } else if error is URLError, settings.refreshMinutes > 1 {
+            // Network blips (e.g. right after login / wake) shouldn't leave the icon stale
+            // for a full interval.
+            scheduleRetry(at: Date().addingTimeInterval(60))
+        }
+    }
+
+    private func scheduleRetry(at date: Date) {
+        retryTask?.cancel()
+        let delay = max(0, date.timeIntervalSinceNow)
         retryTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 60_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard !Task.isCancelled else { return }
             self?.refreshNow()
         }
@@ -206,6 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             status = lastError == nil ? "Not updated yet" : "No data yet"
         }
+        if !isRefreshing, let next = backoff.nextAttempt, next > now {
+            status += " · next try in \(UsageFormatting.duration(next.timeIntervalSince(now)))"
+        }
         if settings.dataSource == .claudeAI,
            organizations.count > 1,
            let org = organizations.first(where: { $0.id == activeOrganizationID }) {
@@ -214,7 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(infoItem(status, color: .secondaryLabelColor))
 
         menu.addItem(.separator())
-        menu.addItem(actionItem("Refresh Now", #selector(refreshNow), key: "r"))
+        menu.addItem(actionItem("Refresh Now", #selector(refreshFromMenu), key: "r"))
         menu.addItem(actionItem("Open claude.ai Usage Page", #selector(openUsagePage)))
         menu.addItem(.separator())
 
@@ -339,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectOrganization(_ sender: NSMenuItem) {
         settings.organizationID = sender.representedObject as? String
-        refreshNow()
+        refresh(userInitiated: true)
     }
 
     @objc private func selectInterval(_ sender: NSMenuItem) {
@@ -388,9 +424,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastError = nil
         organizations = []
         activeOrganizationID = nil
+        backoff.reset()
         Task {
             await service.reset()
-            refreshNow()
+            refresh(userInitiated: true)
         }
         updateStatusButton()
     }

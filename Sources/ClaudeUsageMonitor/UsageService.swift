@@ -5,7 +5,8 @@ enum UsageError: LocalizedError {
     case notConfigured(String)
     case unauthorized(String)
     case blockedByCloudflare(DataSource)
-    case rateLimited
+    /// HTTP 429, with the server's `Retry-After` in seconds if it sent one.
+    case rateLimited(retryAfter: TimeInterval?)
     case notFound
     case http(Int, String)
 
@@ -16,7 +17,7 @@ enum UsageError: LocalizedError {
         case .blockedByCloudflare(let source):
             return "Request was blocked by Cloudflare — try again later"
                 + (source == .claudeAI ? " or set a fresh session key" : "")
-        case .rateLimited: return "Rate limited by the server — will retry on the next refresh"
+        case .rateLimited: return "Rate limited by the server — backing off"
         case .notFound: return "Organization not found"
         case .http(let code, let body): return "HTTP \(code)" + (body.isEmpty ? "" : ": \(body)")
         }
@@ -28,6 +29,25 @@ enum UsageError: LocalizedError {
         case .notConfigured, .unauthorized: return true
         default: return false
         }
+    }
+
+    var isUnauthorized: Bool {
+        if case .unauthorized = self { return true }
+        return false
+    }
+
+    /// Whether the server is telling us to slow down, so automatic refreshes should back off.
+    var isThrottling: Bool {
+        switch self {
+        case .rateLimited, .blockedByCloudflare: return true
+        case .http(let code, _): return code >= 500
+        default: return false
+        }
+    }
+
+    var retryAfter: TimeInterval? {
+        if case .rateLimited(let retryAfter) = self { return retryAfter }
+        return nil
     }
 }
 
@@ -47,6 +67,10 @@ actor UsageService {
     /// Set when the user refused Keychain access to Claude Code's login, so the app doesn't
     /// ask again on every refresh. Cleared by `reset()` (switching data source) or relaunching.
     private var oauthAccessDenied = false
+    /// The credential (session key or Claude Code access token) the server last rejected, and
+    /// the error it caused. Automatic refreshes don't send that credential again; they fail
+    /// locally with the same error until the credential changes. "Refresh Now" still sends it.
+    private var rejection: (credential: String, error: UsageError)?
 
     // A browser-like UA; claude.ai sits behind Cloudflare, which is wary of unknown clients.
     private let userAgent =
@@ -66,17 +90,38 @@ actor UsageService {
         organizations = []
         cachedOAuth = nil
         oauthAccessDenied = false
+        rejection = nil
     }
 
-    func fetch(source: DataSource, sessionKey: String?, preferredOrgID: String?) async throws -> FetchResult {
+    /// - Parameter userInitiated: true for "Refresh Now" and settings changes. Those also retry
+    ///   a credential the server has rejected; automatic refreshes don't.
+    func fetch(
+        source: DataSource, sessionKey: String?, preferredOrgID: String?, userInitiated: Bool
+    ) async throws -> FetchResult {
         switch source {
         case .claudeAI:
             guard let sessionKey, !sessionKey.isEmpty else {
                 throw UsageError.notConfigured("No claude.ai session key set — choose Settings → Set Session Key…")
             }
-            return try await fetchClaudeAI(sessionKey: sessionKey, preferredOrgID: preferredOrgID)
+            try checkNotRejected(sessionKey, userInitiated: userInitiated)
+            do {
+                let result = try await fetchClaudeAI(sessionKey: sessionKey, preferredOrgID: preferredOrgID)
+                rejection = nil
+                return result
+            } catch let error as UsageError where error.isUnauthorized {
+                rejection = (sessionKey, error)
+                throw error
+            }
         case .claudeCode:
-            return try await fetchClaudeCode()
+            let result = try await fetchClaudeCode(userInitiated: userInitiated)
+            rejection = nil
+            return result
+        }
+    }
+
+    private func checkNotRejected(_ credential: String, userInitiated: Bool) throws {
+        if !userInitiated, let rejection, rejection.credential == credential {
+            throw rejection.error
         }
     }
 
@@ -116,8 +161,11 @@ actor UsageService {
 
     // MARK: Claude Code (OAuth token from Keychain)
 
-    private func fetchClaudeCode(isRetry: Bool = false) async throws -> FetchResult {
-        let credentials = try oauthCredentials(forceReload: isRetry)
+    private func fetchClaudeCode(userInitiated: Bool, isRetry: Bool = false) async throws -> FetchResult {
+        // While a token is rejected, re-read the Keychain each time: running `claude` replaces it.
+        let credentials = try oauthCredentials(forceReload: isRetry || rejection != nil)
+        // The retry after a 401 only makes sense if Claude Code has stored a different token.
+        try checkNotRejected(credentials.accessToken, userInitiated: userInitiated && !isRetry)
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.setValue("Bearer \(credentials.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -126,12 +174,14 @@ actor UsageService {
         do {
             let data = try await send(request, source: .claudeCode)
             return FetchResult(snapshot: try UsageParser.parse(data), organizations: [], organizationID: nil)
-        } catch UsageError.unauthorized where !isRetry {
+        } catch UsageError.unauthorized {
+            let error = UsageError.unauthorized(
+                "Claude Code token rejected — run `claude` in a terminal to refresh your login")
+            rejection = (credentials.accessToken, error)
+            if isRetry { throw error }
             // Claude Code may have refreshed the token since we cached it.
             cachedOAuth = nil
-            return try await fetchClaudeCode(isRetry: true)
-        } catch UsageError.unauthorized {
-            throw UsageError.unauthorized("Claude Code token rejected — run `claude` in a terminal to refresh your login")
+            return try await fetchClaudeCode(userInitiated: userInitiated, isRetry: true)
         } catch UsageError.notFound {
             // `.notFound` reads "Organization not found", which only makes sense for claude.ai.
             throw UsageError.http(404, "usage endpoint not found — check for an app update")
@@ -178,7 +228,8 @@ actor UsageService {
         case 404:
             throw UsageError.notFound
         case 429:
-            throw UsageError.rateLimited
+            throw UsageError.rateLimited(
+                retryAfter: RetryAfter.parse(http.value(forHTTPHeaderField: "Retry-After")))
         default:
             if isCloudflareChallenge(http, data) { throw UsageError.blockedByCloudflare(source) }
             let body = String(decoding: data.prefix(120), as: UTF8.self)
