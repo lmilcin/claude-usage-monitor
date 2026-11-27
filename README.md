@@ -1,5 +1,12 @@
 # Claude Usage Monitor
 
+> [!WARNING]
+> **NOT AFFILIATED WITH ANTHROPIC.** This is an unofficial, independent project. It is not made,
+> endorsed or supported by Anthropic. It reads your usage through the same internal, undocumented
+> endpoints that the claude.ai web page and Claude Code's `/usage` command use. They can change or
+> stop working without notice, and using them this way may not be covered by Anthropic's terms.
+> Use it at your own risk.
+
 A small macOS menu bar app that shows how much of your Claude plan limits is left, so you
 don't have to keep opening claude.ai → Settings → Usage.
 
@@ -14,17 +21,77 @@ The bars turn orange when 25% or less is left and red at 10% or less. Click the 
 every limit (including model-specific weekly ones, if your plan has them), with "% left /
 % used" and when each one resets.
 
-Settings (from the menu):
+## Requirements
+
+- macOS 13 (Ventura) or later, on Apple silicon or Intel
+- A Claude subscription, and either a claude.ai login in your browser or the Claude Code CLI
+  logged in on the same Mac (see [Data sources](#data-sources))
+
+## Installing
+
+Download `ClaudeUsageMonitor.zip` from the
+[latest release](https://github.com/lmilcin/claude-usage-monitor/releases/latest).
+
+The easiest way is the `gh` CLI. Files downloaded this way don't get the quarantine flag, so
+Gatekeeper won't complain:
+
+```sh
+gh release download --repo lmilcin/claude-usage-monitor --pattern 'ClaudeUsageMonitor.zip*'
+# verify it here, see below
+unzip ClaudeUsageMonitor.zip && mv ClaudeUsageMonitor.app /Applications/
+open /Applications/ClaudeUsageMonitor.app
+```
+
+The app is only **ad-hoc signed**: there's no Apple Developer ID and no notarization. If you
+download it with a browser instead, macOS will refuse to open it. In that case, either run
+`xattr -dr com.apple.quarantine /Applications/ClaudeUsageMonitor.app`, or try to open it once and
+then go to *System Settings → Privacy & Security → Open Anyway*.
+
+Note: after installing a new build, macOS may ask again for Keychain access. The Keychain ties
+access to the code signature, and an ad-hoc signature changes with every build.
+
+### Verify your download
+
+This app handles a credential for your Claude account, so check that the zip you got is the one
+this repository's CI built. Every release publishes two things for that:
+
+**A build provenance attestation.** It is signed by GitHub Actions and proves the zip was built
+by this repository's workflow from the tagged source. This is the stronger check:
+
+```sh
+gh attestation verify ClaudeUsageMonitor.zip --repo lmilcin/claude-usage-monitor
+```
+
+**A SHA-256 hash.** It is printed in the notes of each
+[release](https://github.com/lmilcin/claude-usage-monitor/releases) and attached as
+`ClaudeUsageMonitor.zip.sha256`. Compare it with your file:
+
+```sh
+shasum -a 256 ClaudeUsageMonitor.zip          # compare with the hash in the release notes
+shasum -a 256 -c ClaudeUsageMonitor.zip.sha256   # or let shasum compare it
+```
+
+The hash is different for every release, which is why it lives with the release and not in this
+file.
+
+### Updates
+
+The app doesn't update itself. Once a day it asks GitHub's public API whether a newer release
+exists, and if so shows **Update Available** in the menu, which opens the release page. The
+request carries no account data. You can turn it off under **Settings → Check for Updates
+Automatically**, and check by hand with **Check for Updates…**.
+
+## Settings
+
+From the menu:
 
 - **Data Source**: a claude.ai session key, or your Claude Code CLI login
 - **Refresh Every**: 1–30 minutes (default 5)
 - **Menu Bar Icon**: session and weekly bars, session only, or weekly only
 - **Show Percentage in Menu Bar**: adds text like `63% · 48%` next to the icon
 - **Launch at Login**
+- **Check for Updates Automatically**: on by default
 - **Organization**: only appears if your session key can see more than one claude.ai org
-
-> Unofficial. It uses the same internal endpoints the claude.ai web page and Claude Code's
-> `/usage` command use. These are undocumented and could change without notice.
 
 ## Data sources
 
@@ -42,32 +109,6 @@ The session key is stored in your login Keychain and is only ever sent to `claud
 3. Go to **Storage** (Safari) or **Application** (Chrome) → **Cookies** → `https://claude.ai`.
 4. Copy the value of `sessionKey` (it starts with `sk-ant-sid`). Then paste it into the app via
    **Settings → Set Session Key…**.
-
-## Installing
-
-The app is built by GitHub Actions on a macOS runner. Every push to `main` uploads a
-`ClaudeUsageMonitor` artifact, and pushing a `v*` tag also publishes a GitHub Release with the zip.
-
-The easiest way to get it onto your Mac is with the `gh` CLI. Files downloaded this way don't get
-the quarantine flag, so Gatekeeper won't complain:
-
-```sh
-# latest release
-gh release download --repo <owner>/claude-usage-monitor --pattern ClaudeUsageMonitor.zip
-# …or the newest CI build
-gh run download --repo <owner>/claude-usage-monitor --name ClaudeUsageMonitor
-
-unzip ClaudeUsageMonitor.zip && mv ClaudeUsageMonitor.app /Applications/
-open /Applications/ClaudeUsageMonitor.app
-```
-
-The app is only **ad-hoc signed**: there's no Apple Developer ID and no notarization. If you
-download it with a browser instead, macOS will refuse to open it. In that case, either run
-`xattr -dr com.apple.quarantine /Applications/ClaudeUsageMonitor.app`, or try to open it once and
-then go to *System Settings → Privacy & Security → Open Anyway*.
-
-Note: after installing a new build, macOS may ask again for Keychain access. The Keychain ties
-access to the code signature, and an ad-hoc signature changes with every build.
 
 ## Building
 
@@ -87,13 +128,27 @@ The `UsageCore` target is plain Foundation, so its tests also run on Linux:
 docker run --rm -v "$PWD":/pkg -w /pkg swift:6.1 swift test   # app target is skipped off-macOS
 ```
 
+### CI and releases
+
+GitHub Actions builds the app on a macOS runner. Every push to `main` uploads a
+`ClaudeUsageMonitor` artifact, which you can fetch with
+`gh run download --repo lmilcin/claude-usage-monitor --name ClaudeUsageMonitor`. These builds are
+versioned `0.0.0-<run>` and have no attestation.
+
+Pushing a `v*` tag also publishes a GitHub Release with the zip, its SHA-256 and the build
+provenance attestation.
+
 ## Layout
 
 ```
-Sources/UsageCore/            # JSON parsing, org selection, time formatting (cross-platform, tested)
+Sources/UsageCore/            # JSON parsing, org selection, formatting, version comparison (cross-platform, tested)
 Sources/ClaudeUsageMonitor/   # AppKit app: status item, icon drawing, menu, Keychain, networking
 Tests/UsageCoreTests/
 packaging/Info.plist          # LSUIElement app bundle template
 scripts/build-app.sh          # universal build → .app → ad-hoc codesign → zip
 .github/workflows/build.yml
 ```
+
+## License
+
+[MIT](LICENSE)

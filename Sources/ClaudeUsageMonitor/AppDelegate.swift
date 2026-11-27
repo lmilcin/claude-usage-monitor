@@ -19,6 +19,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var retryTask: Task<Void, Never>?
 
+    private let updates = UpdateService()
+    private var availableUpdate: ReleaseInfo?
+    /// Kept in memory only, so the check also runs once per launch.
+    private var lastUpdateCheck: Date?
+
     private static let usagePageURL = URL(string: "https://claude.ai/settings/usage")!
 
     // MARK: Lifecycle
@@ -69,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshNow() {
+        checkForUpdatesIfDue()
         guard !isRefreshing else { return }
         isRefreshing = true
         retryTask?.cancel()
@@ -190,9 +196,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(actionItem("Open claude.ai Usage Page", #selector(openUsagePage)))
         menu.addItem(.separator())
 
+        if let availableUpdate {
+            menu.addItem(actionItem("Update Available: \(availableUpdate.version)…", #selector(openUpdatePage)))
+        }
+
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
         settingsItem.submenu = buildSettingsMenu()
         menu.addItem(settingsItem)
+        menu.addItem(actionItem("Check for Updates…", #selector(checkForUpdates)))
         menu.addItem(actionItem("About Claude Usage Monitor", #selector(showAbout)))
         menu.addItem(actionItem("Quit", #selector(quit), key: "q"))
     }
@@ -252,6 +263,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let login = actionItem("Launch at Login", #selector(toggleLaunchAtLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         sub.addItem(login)
+        let autoUpdate = actionItem("Check for Updates Automatically", #selector(toggleAutoUpdateCheck))
+        autoUpdate.state = settings.autoUpdateCheck ? .on : .off
+        sub.addItem(autoUpdate)
         return sub
     }
 
@@ -352,6 +366,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshNow()
         }
         updateStatusButton()
+    }
+
+    // MARK: Updates
+
+    /// Quietly asks GitHub for the latest release, at most once a day. A newer one only
+    /// adds a menu item; nothing is downloaded and no alert is shown.
+    private func checkForUpdatesIfDue() {
+        guard settings.autoUpdateCheck, !UpdateChecker.isDevelopmentBuild(AppInfo.version) else { return }
+        if let lastUpdateCheck, Date().timeIntervalSince(lastUpdateCheck) < 24 * 3600 { return }
+        lastUpdateCheck = Date()
+        Task {
+            guard let release = try? await updates.latestRelease() else { return }
+            availableUpdate = UpdateChecker.isNewer(release.version, than: AppInfo.version) ? release : nil
+            rebuildMenu()
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        Task {
+            do {
+                let release = try await updates.latestRelease()
+                lastUpdateCheck = Date()
+                presentUpdateResult(release)
+            } catch {
+                showAlert("Couldn't check for updates", error.localizedDescription)
+            }
+        }
+    }
+
+    private func presentUpdateResult(_ release: ReleaseInfo?) {
+        let current = AppInfo.version
+        guard let release else {
+            showAlert("No releases published yet", "You have version \(current).")
+            return
+        }
+        let isDevelopmentBuild = UpdateChecker.isDevelopmentBuild(current)
+        let isNewer = UpdateChecker.isNewer(release.version, than: current)
+        availableUpdate = isNewer && !isDevelopmentBuild ? release : nil
+        rebuildMenu()
+
+        guard isNewer else {
+            showAlert("You're up to date", "Version \(current) is the latest release.")
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        if isDevelopmentBuild {
+            alert.messageText = "Latest release: \(release.version)"
+            alert.informativeText =
+                "You're running a development build (\(current)), which may already be newer than that release."
+        } else {
+            alert.messageText = "Version \(release.version) is available"
+            alert.informativeText = "You have version \(current). The app doesn't update itself — "
+                + "download the new version from the release page."
+        }
+        alert.addButton(withTitle: "Open Release Page")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(release.pageURL)
+        }
+    }
+
+    @objc private func openUpdatePage() {
+        NSWorkspace.shared.open(availableUpdate?.pageURL ?? AppInfo.releasesURL)
+    }
+
+    @objc private func toggleAutoUpdateCheck() {
+        settings.autoUpdateCheck.toggle()
+        if settings.autoUpdateCheck {
+            checkForUpdatesIfDue()
+        } else {
+            availableUpdate = nil
+        }
     }
 
     // MARK: Setup dialogs

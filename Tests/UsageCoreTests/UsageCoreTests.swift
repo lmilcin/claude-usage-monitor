@@ -93,3 +93,43 @@ final class FormattingTests: XCTestCase {
         XCTAssertTrue(far.hasSuffix("(in 3d 1h)"), far)
     }
 }
+
+final class UpdateCheckerTests: XCTestCase {
+    func testIsNewerComparesNumericComponents() {
+        XCTAssertTrue(UpdateChecker.isNewer("0.2.0", than: "0.1.0"))
+        XCTAssertTrue(UpdateChecker.isNewer("v0.10.0", than: "0.9.3"))
+        XCTAssertTrue(UpdateChecker.isNewer("1.0", than: "0.9.9"))
+        XCTAssertTrue(UpdateChecker.isNewer("1.0.1", than: "1.0"))
+        XCTAssertFalse(UpdateChecker.isNewer("0.1.0", than: "0.1.0"))
+        XCTAssertFalse(UpdateChecker.isNewer("v0.1.0", than: "0.1"))
+        XCTAssertFalse(UpdateChecker.isNewer("0.1.0", than: "0.2.0"))
+        XCTAssertFalse(UpdateChecker.isNewer("nightly", than: "0.1.0"))
+    }
+
+    func testDevelopmentBuilds() {
+        XCTAssertTrue(UpdateChecker.isDevelopmentBuild("0.0.0-dev"))
+        XCTAssertTrue(UpdateChecker.isDevelopmentBuild("0.0.0-42"))
+        XCTAssertFalse(UpdateChecker.isDevelopmentBuild("0.1.0"))
+        XCTAssertTrue(UpdateChecker.isNewer("0.1.0", than: "0.0.0-42"))
+    }
+
+    func testParsesLatestRelease() {
+        let json = """
+        {"tag_name": "v0.2.0", "name": "v0.2.0", "draft": false,
+         "html_url": "https://github.com/lmilcin/claude-usage-monitor/releases/tag/v0.2.0"}
+        """
+        let release = UpdateChecker.parseLatestRelease(Data(json.utf8))
+        XCTAssertEqual(release?.version, "0.2.0")
+        XCTAssertEqual(release?.pageURL.absoluteString,
+                       "https://github.com/lmilcin/claude-usage-monitor/releases/tag/v0.2.0")
+    }
+
+    func testRejectsReleasesWithoutAGitHubPage() {
+        let foreign = #"{"tag_name": "v9.9.9", "html_url": "https://example.com/download"}"#
+        XCTAssertNil(UpdateChecker.parseLatestRelease(Data(foreign.utf8)))
+        let insecure = #"{"tag_name": "v9.9.9", "html_url": "http://github.com/x/y/releases/tag/v9.9.9"}"#
+        XCTAssertNil(UpdateChecker.parseLatestRelease(Data(insecure.utf8)))
+        XCTAssertNil(UpdateChecker.parseLatestRelease(Data(#"{"message": "Not Found"}"#.utf8)))
+        XCTAssertNil(UpdateChecker.parseLatestRelease(Data("<html>".utf8)))
+    }
+}

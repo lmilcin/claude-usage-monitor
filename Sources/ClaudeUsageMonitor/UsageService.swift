@@ -4,7 +4,7 @@ import UsageCore
 enum UsageError: LocalizedError {
     case notConfigured(String)
     case unauthorized(String)
-    case blockedByCloudflare
+    case blockedByCloudflare(DataSource)
     case rateLimited
     case notFound
     case http(Int, String)
@@ -13,7 +13,9 @@ enum UsageError: LocalizedError {
         switch self {
         case .notConfigured(let message): return message
         case .unauthorized(let message): return message
-        case .blockedByCloudflare: return "Request was blocked by Cloudflare — try again later or set a fresh session key"
+        case .blockedByCloudflare(let source):
+            return "Request was blocked by Cloudflare — try again later"
+                + (source == .claudeAI ? " or set a fresh session key" : "")
         case .rateLimited: return "Rate limited by the server — will retry on the next refresh"
         case .notFound: return "Organization not found"
         case .http(let code, let body): return "HTTP \(code)" + (body.isEmpty ? "" : ": \(body)")
@@ -78,7 +80,8 @@ actor UsageService {
 
     private func fetchClaudeAI(sessionKey: String, preferredOrgID: String?, isRetry: Bool = false) async throws -> FetchResult {
         if organizations.isEmpty {
-            let data = try await send(claudeAIRequest("https://claude.ai/api/organizations", sessionKey: sessionKey))
+            let data = try await send(
+                claudeAIRequest("https://claude.ai/api/organizations", sessionKey: sessionKey), source: .claudeAI)
             organizations = try Organization.parseList(data)
         }
         guard let org = Organization.choose(from: organizations, preferredID: preferredOrgID) else {
@@ -87,7 +90,7 @@ actor UsageService {
 
         do {
             let data = try await send(claudeAIRequest(
-                "https://claude.ai/api/organizations/\(org.id)/usage", sessionKey: sessionKey))
+                "https://claude.ai/api/organizations/\(org.id)/usage", sessionKey: sessionKey), source: .claudeAI)
             let snapshot = try UsageParser.parse(data)
             return FetchResult(snapshot: snapshot, organizations: organizations, organizationID: org.id)
         } catch UsageError.notFound where !isRetry {
@@ -117,7 +120,7 @@ actor UsageService {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("claude-usage-monitor/1.0", forHTTPHeaderField: "User-Agent")
         do {
-            let data = try await send(request)
+            let data = try await send(request, source: .claudeCode)
             return FetchResult(snapshot: try UsageParser.parse(data), organizations: [], organizationID: nil)
         } catch UsageError.unauthorized where !isRetry {
             // Claude Code may have refreshed the token since we cached it.
@@ -125,6 +128,9 @@ actor UsageService {
             return try await fetchClaudeCode(isRetry: true)
         } catch UsageError.unauthorized {
             throw UsageError.unauthorized("Claude Code token rejected — run `claude` in a terminal to refresh your login")
+        } catch UsageError.notFound {
+            // `.notFound` reads "Organization not found", which only makes sense for claude.ai.
+            throw UsageError.http(404, "usage endpoint not found — check for an app update")
         }
     }
 
@@ -146,7 +152,7 @@ actor UsageService {
 
     // MARK: HTTP
 
-    private func send(_ request: URLRequest) async throws -> Data {
+    private func send(_ request: URLRequest, source: DataSource) async throws -> Data {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw UsageError.http(0, "no response") }
         switch http.statusCode {
@@ -155,14 +161,14 @@ actor UsageService {
         case 401:
             throw UsageError.unauthorized("Session key invalid or expired — set a new one in Settings")
         case 403:
-            if isCloudflareChallenge(http, data) { throw UsageError.blockedByCloudflare }
+            if isCloudflareChallenge(http, data) { throw UsageError.blockedByCloudflare(source) }
             throw UsageError.unauthorized("Access denied (403) — the session key may have expired")
         case 404:
             throw UsageError.notFound
         case 429:
             throw UsageError.rateLimited
         default:
-            if isCloudflareChallenge(http, data) { throw UsageError.blockedByCloudflare }
+            if isCloudflareChallenge(http, data) { throw UsageError.blockedByCloudflare(source) }
             let body = String(decoding: data.prefix(120), as: UTF8.self)
             throw UsageError.http(http.statusCode, body)
         }

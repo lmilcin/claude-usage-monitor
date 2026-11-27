@@ -70,6 +70,12 @@ final class Settings {
         set { defaults.set(newValue, forKey: "hasCompletedSetup") }
     }
 
+    /// Ask GitHub once a day whether a newer release exists (on unless turned off).
+    var autoUpdateCheck: Bool {
+        get { defaults.object(forKey: "autoUpdateCheck") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "autoUpdateCheck") }
+    }
+
     var sessionKey: String? {
         get {
             Keychain.read(service: keychainService, account: keychainAccount)
