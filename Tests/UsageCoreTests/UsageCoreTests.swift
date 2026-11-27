@@ -133,3 +133,124 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertNil(UpdateChecker.parseLatestRelease(Data("<html>".utf8)))
     }
 }
+
+/// A stand-in for the Keychain that counts how often it is touched.
+private final class FakeSecretBackend: SecretBackend, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _reads = 0
+    private var _writes: [String?] = []
+    var nextRead: SecretReadResult
+    var writeError: SecretStoreError?
+
+    init(_ nextRead: SecretReadResult) { self.nextRead = nextRead }
+
+    var reads: Int { lock.withLock { _reads } }
+    var writes: [String?] { lock.withLock { _writes } }
+
+    func read() -> SecretReadResult {
+        lock.withLock { _reads += 1; return nextRead }
+    }
+
+    func write(_ value: String?) throws {
+        try lock.withLock {
+            _writes.append(value)
+            if let writeError { throw writeError }
+        }
+    }
+}
+
+final class CachedSecretTests: XCTestCase {
+    func testReadsTheBackendOnlyOnce() async {
+        let backend = FakeSecretBackend(.found("sk-ant-sid01-abc"))
+        let secret = CachedSecret(backend: backend)
+        for _ in 0..<5 {
+            let (status, value) = await secret.load()
+            XCTAssertEqual(status, .present)
+            XCTAssertEqual(value, "sk-ant-sid01-abc")
+        }
+        XCTAssertEqual(backend.reads, 1)
+    }
+
+    func testMissingIsCached() async {
+        let backend = FakeSecretBackend(.notFound)
+        let secret = CachedSecret(backend: backend)
+        _ = await secret.load()
+        let (status, value) = await secret.load()
+        XCTAssertEqual(status, .missing)
+        XCTAssertNil(value)
+        XCTAssertEqual(backend.reads, 1)
+    }
+
+    func testEmptyValueCountsAsMissing() async {
+        let (status, value) = await CachedSecret(backend: FakeSecretBackend(.found(""))).load()
+        XCTAssertEqual(status, .missing)
+        XCTAssertNil(value)
+    }
+
+    /// Clicking "Deny" must not bring the prompt back on every refresh.
+    func testDenialIsNotRetried() async {
+        let backend = FakeSecretBackend(.denied)
+        let secret = CachedSecret(backend: backend)
+        _ = await secret.load()
+        backend.nextRead = .found("sk-ant-sid01-abc")
+        let (status, value) = await secret.load()
+        XCTAssertEqual(status, .denied)
+        XCTAssertNil(value)
+        XCTAssertEqual(backend.reads, 1)
+    }
+
+    func testOtherFailuresAreRetried() async {
+        let backend = FakeSecretBackend(.failed(-25308))
+        let secret = CachedSecret(backend: backend)
+        let first = await secret.load()
+        XCTAssertEqual(first.status, .failed(-25308))
+        backend.nextRead = .found("sk-ant-sid01-abc")
+        let second = await secret.load()
+        XCTAssertEqual(second.status, .present)
+        XCTAssertEqual(backend.reads, 2)
+    }
+
+    func testSaveReplacesTheCacheWithoutReading() async throws {
+        let backend = FakeSecretBackend(.denied)
+        let secret = CachedSecret(backend: backend)
+        _ = await secret.load()
+        try await secret.save("sk-ant-sid01-new")
+        let (status, value) = await secret.load()
+        XCTAssertEqual(status, .present)
+        XCTAssertEqual(value, "sk-ant-sid01-new")
+        XCTAssertEqual(backend.reads, 1)
+        XCTAssertEqual(backend.writes, ["sk-ant-sid01-new"])
+
+        try await secret.save(nil)
+        let removed = await secret.load()
+        XCTAssertEqual(removed.status, .missing)
+        XCTAssertEqual(backend.writes, ["sk-ant-sid01-new", nil])
+    }
+
+    func testFailedSaveStillUsesTheNewValueUntilQuit() async {
+        let backend = FakeSecretBackend(.notFound)
+        backend.writeError = SecretStoreError("write failed")
+        let secret = CachedSecret(backend: backend)
+        do {
+            try await secret.save("sk-ant-sid01-new")
+            XCTFail("expected the write error")
+        } catch {
+            XCTAssertEqual(error as? SecretStoreError, SecretStoreError("write failed"))
+        }
+        let (status, value) = await secret.load()
+        XCTAssertEqual(status, .present)
+        XCTAssertEqual(value, "sk-ant-sid01-new")
+        XCTAssertEqual(backend.reads, 0)
+    }
+
+    func testResetReadsAgain() async {
+        let backend = FakeSecretBackend(.denied)
+        let secret = CachedSecret(backend: backend)
+        _ = await secret.load()
+        await secret.reset()
+        backend.nextRead = .found("sk-ant-sid01-abc")
+        let (status, _) = await secret.load()
+        XCTAssertEqual(status, .present)
+        XCTAssertEqual(backend.reads, 2)
+    }
+}

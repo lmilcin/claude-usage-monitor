@@ -26,14 +26,12 @@ enum IconMode: String, CaseIterable {
     }
 }
 
-/// User preferences. Everything except the session key lives in UserDefaults;
-/// the session key is stored in the Keychain.
+/// User preferences, kept in UserDefaults. The session key is not here: it lives in the
+/// Keychain and is read through `SessionKeyStore` (see AppDelegate).
 final class Settings {
     static let shared = Settings()
 
     private let defaults = UserDefaults.standard
-    private let keychainService = "ClaudeUsageMonitor"
-    private let keychainAccount = "sessionKey"
 
     static let refreshChoices = [1, 2, 5, 10, 15, 30]
 
@@ -74,21 +72,6 @@ final class Settings {
     var autoUpdateCheck: Bool {
         get { defaults.object(forKey: "autoUpdateCheck") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "autoUpdateCheck") }
-    }
-
-    var sessionKey: String? {
-        get {
-            Keychain.read(service: keychainService, account: keychainAccount)
-                .map { String(decoding: $0, as: UTF8.self) }
-                .flatMap { $0.isEmpty ? nil : $0 }
-        }
-        set {
-            if let newValue, !newValue.isEmpty {
-                Keychain.write(Data(newValue.utf8), service: keychainService, account: keychainAccount)
-            } else {
-                Keychain.delete(service: keychainService, account: keychainAccount)
-            }
-        }
     }
 
     /// Accepts the raw cookie value, or a pasted `sessionKey=...` / full Cookie header.

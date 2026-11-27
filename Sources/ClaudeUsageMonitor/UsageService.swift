@@ -44,6 +44,9 @@ actor UsageService {
     private let session: URLSession
     private var organizations: [Organization] = []
     private var cachedOAuth: OAuthCredentials?
+    /// Set when the user refused Keychain access to Claude Code's login, so the app doesn't
+    /// ask again on every refresh. Cleared by `reset()` (switching data source) or relaunching.
+    private var oauthAccessDenied = false
 
     // A browser-like UA; claude.ai sits behind Cloudflare, which is wary of unknown clients.
     private let userAgent =
@@ -62,6 +65,7 @@ actor UsageService {
     func reset() {
         organizations = []
         cachedOAuth = nil
+        oauthAccessDenied = false
     }
 
     func fetch(source: DataSource, sessionKey: String?, preferredOrgID: String?) async throws -> FetchResult {
@@ -136,7 +140,15 @@ actor UsageService {
 
     private func oauthCredentials(forceReload: Bool) throws -> OAuthCredentials {
         if !forceReload, let cached = cachedOAuth, !cached.isExpired { return cached }
-        guard let loaded = OAuthCredentials.load() else {
+        if oauthAccessDenied { throw OAuthCredentials.accessDeniedError }
+        let loaded: OAuthCredentials
+        switch OAuthCredentials.load() {
+        case .found(let credentials):
+            loaded = credentials
+        case .denied:
+            oauthAccessDenied = true
+            throw OAuthCredentials.accessDeniedError
+        case .notFound:
             throw UsageError.notConfigured(
                 "Claude Code login not found in Keychain — run `claude` and log in, or use a claude.ai session key")
         }
@@ -193,16 +205,28 @@ struct OAuthCredentials: Sendable {
         return expiresAt.timeIntervalSinceNow < 30
     }
 
-    static func load() -> OAuthCredentials? {
-        if let data = Keychain.read(service: "Claude Code-credentials"), let creds = parse(data) {
-            return creds
+    enum LoadResult {
+        case found(OAuthCredentials)
+        case denied
+        case notFound
+    }
+
+    static let accessDeniedError = UsageError.notConfigured(
+        "Keychain access to the Claude Code login was denied — choose the data source again, "
+            + "or relaunch the app, to be asked again")
+
+    /// Reads the Keychain item, then the file. Blocks while a Keychain prompt is on screen.
+    static func load() -> LoadResult {
+        let keychain = Keychain.read(service: "Claude Code-credentials")
+        if case .found(let json) = keychain, let creds = parse(Data(json.utf8)) {
+            return .found(creds)
         }
         let file = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
         if let data = try? Data(contentsOf: file), let creds = parse(data) {
-            return creds
+            return .found(creds)
         }
-        return nil
+        return keychain == .denied ? .denied : .notFound
     }
 
     static func parse(_ data: Data) -> OAuthCredentials? {

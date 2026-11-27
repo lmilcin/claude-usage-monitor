@@ -47,8 +47,21 @@ download it with a browser instead, macOS will refuse to open it. In that case, 
 `xattr -dr com.apple.quarantine /Applications/ClaudeUsageMonitor.app`, or try to open it once and
 then go to *System Settings → Privacy & Security → Open Anyway*.
 
-Note: after installing a new build, macOS may ask again for Keychain access. The Keychain ties
-access to the code signature, and an ad-hoc signature changes with every build.
+### Keychain prompts after installing or updating
+
+The Keychain trusts an app by its code signature, and an ad-hoc signature changes with every
+build. So after each update macOS asks whether the new build may read the session key (or Claude
+Code's login). Enter your **login keychain password**, which is normally your Mac login password,
+and click **Always Allow**. "Allow" works too, but then you'll be asked again on the next launch.
+If you click **Deny**, the app won't ask again until you relaunch it or set the key again.
+
+If the prompts won't go away, delete the old item and set the key again. The app then creates a
+fresh item that this build already trusts:
+
+1. Quit the app (or force-quit it from Activity Monitor).
+2. Open **Keychain Access**, search for `ClaudeUsageMonitor`, and delete that item. Or run
+   `security delete-generic-password -s ClaudeUsageMonitor -a sessionKey` in Terminal.
+3. Start the app and choose **Settings → Set Session Key…**.
 
 ### Verify your download
 

@@ -6,6 +6,11 @@ import UsageCore
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let settings = Settings.shared
     private let service = UsageService()
+    /// The claude.ai session key. Read from the Keychain once, off the main thread: a read can
+    /// show a password prompt and block until it's answered (always the case after an update).
+    private let sessionKeys = CachedSecret(backend: SessionKeyKeychainItem())
+    /// Main-thread copy of `sessionKeys.status`, for the menu. Never touches the Keychain.
+    private var sessionKeyStatus: CachedSecret.Status = .unknown
 
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -81,11 +86,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
 
         let source = settings.dataSource
-        let key = source == .claudeAI ? settings.sessionKey : nil
         let orgID = settings.organizationID
 
         Task {
             do {
+                let key = source == .claudeAI ? try await loadSessionKey() : nil
                 let result = try await service.fetch(source: source, sessionKey: key, preferredOrgID: orgID)
                 snapshot = result.snapshot
                 organizations = result.organizations
@@ -98,6 +103,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isRefreshing = false
             updateStatusButton()
             rebuildMenu()
+        }
+    }
+
+    /// The session key, from memory after the first successful Keychain read.
+    private func loadSessionKey() async throws -> String? {
+        let (status, key) = await sessionKeys.load()
+        sessionKeyStatus = status
+        switch status {
+        case .denied:
+            throw UsageError.notConfigured(
+                "Keychain access to the session key was denied — set it again in Settings, "
+                    + "or relaunch the app to be asked again")
+        case .failed(let code):
+            throw UsageError.notConfigured(
+                "Couldn't read the session key from the Keychain: \(Keychain.message(for: code))")
+        case .unknown, .missing, .present:
+            return key
         }
     }
 
@@ -222,7 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sub.addItem(submenuItem("Data Source", sourceMenu))
 
         if settings.dataSource == .claudeAI {
-            sub.addItem(actionItem(settings.sessionKey == nil ? "Set Session Key…" : "Change Session Key…",
+            sub.addItem(actionItem(hasStoredSessionKey ? "Change Session Key…" : "Set Session Key…",
                                    #selector(promptForSessionKey)))
             if organizations.count > 1 {
                 let orgMenu = NSMenu()
@@ -307,7 +329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.dataSource = source
         settings.hasCompletedSetup = true
         resetDataAndRefresh()
-        if source == .claudeAI, settings.sessionKey == nil { promptForSessionKey() }
+        guard source == .claudeAI else { return }
+        Task {
+            let (status, _) = await sessionKeys.load()
+            sessionKeyStatus = status
+            if status == .missing { promptForSessionKey() }
+        }
     }
 
     @objc private func selectOrganization(_ sender: NSMenuItem) {
@@ -366,6 +393,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshNow()
         }
         updateStatusButton()
+    }
+
+    /// Whether a session key item exists, even one the Keychain wouldn't let us read.
+    private var hasStoredSessionKey: Bool {
+        sessionKeyStatus == .present || sessionKeyStatus == .denied
+    }
+
+    /// Saves (or with `nil`, removes) the session key off the main thread, then refetches.
+    private func storeSessionKey(_ key: String?) {
+        Task {
+            do {
+                try await sessionKeys.save(key)
+            } catch {
+                showAlert(key == nil ? "Couldn't remove the session key from the Keychain"
+                                     : "Couldn't save the session key to the Keychain",
+                          "\(error.localizedDescription)\n\nThe change applies until you quit the app.")
+            }
+            sessionKeyStatus = await sessionKeys.status
+            resetDataAndRefresh()
+        }
     }
 
     // MARK: Updates
@@ -479,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func promptForSessionKey() {
         NSApp.activate(ignoringOtherApps: true)
-        let hasKey = settings.sessionKey != nil
+        let hasKey = hasStoredSessionKey
 
         let alert = NSAlert()
         alert.messageText = "claude.ai Session Key"
@@ -510,12 +557,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 showAlert("That doesn't look like a session key",
                           "claude.ai session keys start with “sk-ant-sid”. Saved anyway — check the menu for errors.")
             }
-            settings.sessionKey = key
             settings.organizationID = nil
-            resetDataAndRefresh()
+            storeSessionKey(key)
         case .alertThirdButtonReturn:
-            settings.sessionKey = nil
-            resetDataAndRefresh()
+            storeSessionKey(nil)
         default:
             break
         }
